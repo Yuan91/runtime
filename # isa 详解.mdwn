@@ -1,0 +1,80 @@
+# isa 详解
+
+查看objc-runtime的源码，我们可以发现在其`PublicHeader/objc.h`中有如下定义：
+
+```
+/// An opaque type that represents an Objective-C class.
+typedef struct objc_class *Class;
+
+/// Represents an instance of a class.
+struct objc_object {
+    Class _Nonnull isa  OBJC_ISA_AVAILABILITY;
+};
+```
+
+由此可知，在runtime层面是用objc_object 表征一个对象的，用Class也即objc_class表示一个OC类的。那么这个isa到底是什么呢？
+
+
+## isa 简单介绍
+
+* arm64 之前，isa就是一个普通的指针，对象的isa指针指向其class对象的地址，class对象的isa指向其meta-class对象的地址
+
+* arm64 之后，isa是一个共用体，它存储了更多的信息，包含是否有关联对象、是否被弱引用过等信息，该共用体 &`ISA_MASK` 可以得到其class或者meta-class 地址
+
+关于指令集分析[参考这篇文件](https://www.jianshu.com/p/3fce0bd6f045)
+
+## isa 数据结构
+
+arm64 下isa共用体结构
+
+```
+union isa_t {
+    Class cls;
+    uintptr_t bits;
+    struct {
+        uintptr_t nonpointer        : 1; //第1位表示: 是否是优化后的isa指针
+        uintptr_t has_assoc         : 1; //第2位表示: 是否包含关系对象
+        uintptr_t has_cxx_dtor      : 1; //第3位表示：是否有析构函数
+        uintptr_t shiftcls          : 33; //从第4位开始的33位表示：class,meta-class地址 
+        uintptr_t magic             : 6;
+        uintptr_t weakly_referenced : 1;//第43位表示：是否被弱引用过
+        uintptr_t deallocating      : 1;
+        uintptr_t has_sidetable_rc  : 1;
+        uintptr_t extra_rc          : 19;
+    };
+};
+```
+
+详细的介绍
+
+![avatar](https://s1.ax1x.com/2020/03/28/GknJtH.md.png)
+
+## 实例分析isa中数据
+
+测试代码
+
+```
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // Do any additional setup after loading the view.
+    Person *p = [[Person alloc] init];
+    
+    //添加关联对象
+    objc_setAssociatedObject(p,
+                             @"p_associated_key",
+                             @"hello",
+                             OBJC_ASSOCIATION_RETAIN);
+    
+    //添加弱引用
+    __weak Person *weakPerson = p;
+}
+```
+
+在采用arm64的真机上，使用指令`p/x p->isa`打印该对象的isa地址。
+以`0x000005a102fe4ecb`为例分析
+
+![avatar](https://s1.ax1x.com/2020/03/28/Gkukvt.png)
+
+可以看到第1位 nonpointer 为1 表示，是优化的isa的指针
+第2位 has_assoc 为1 表示，是添加过关联对象的
+第43位为1表示，是被弱引用过的

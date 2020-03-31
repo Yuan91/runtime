@@ -1,0 +1,99 @@
+# Objective-C 消息机制
+
+程序中常见的方法调用,在runtime层面其实是调用的objc_msgSend方法.通过clang命令查看源码,可以发现
+```
+Person * p = [[Person alloc]init];
+//objc_msgSend)(p, sel_registerName("test"));
+[p test];
+//objc_msgSend(objc_getClass("Person"), sel_registerName("aClassMethod"));
+[Person aClassMethod];
+```
+这两个方法调用在底层都通过objc_msgSend函数调用实现的.该函数接受两个参数,第一个为消息接收者receiver,第二个为消息名称SEL.
+
+在Objective-C中objc_msgSend的消息机制是分为三个过程的.
+
+* 发送消息: 在当前类对象以及父类对象的方法列表中去寻找是否有该消息对应的方法实现
+
+* 动态方法解析:如果在第一步没有找到消息,则进入动态方法解析流程,这里提供一个在**运行时**添加方法的机会.添加方法之后,会调用objc_msgSend回到发送消息的流程中
+
+* 方法转发:如果前两步都没有处理该消息,那么进入方法转发流程,这里提供一个将消息转发给其他对象/类的机会.
+
+## 发送消息流程
+
+![avatar](https://s1.ax1x.com/2020/03/29/GZXvvQ.png)
+
+receiver在Objective-C中表现为方法的调用者.objc_msgSend会依次从类对象的方法缓存/方法列表/父类的方法缓存/父类的方法列表中寻找该消息,找到之后调用该方法.值得注意的是,在找到方法后会把该消息存在**receiverClass**的方法缓存列表中,即便是在父类中找到该方法的.
+
+## 动态方法解析
+
+![avatar](https://s1.ax1x.com/2020/03/29/GZvMLj.png)
+
+动态方法解析实践
+在Person.h中添加一个fly的方法,然后通过动态方法解析将addFlyRuntime方法的实现映射到该SEL上
+```
+- (void)addFlyRuntime{
+    NSLog(@"真的飞了");
+}
+
++ (BOOL)resolveInstanceMethod:(SEL)sel{
+    if (sel == @selector(fly)) {
+        //获取要添加的method
+        Method method = class_getInstanceMethod(self, @selector(addFlyRuntime));
+        //获取method地址
+        IMP imp = method_getImplementation(method);
+        //获取类型编码
+        const char *types = method_getTypeEncoding(method);
+        //给类动态 添加方法
+        class_addMethod(self, sel, imp, types);
+        return YES;
+    }
+    return [super resolveInstanceMethod:sel];
+}
+```
+
+这里要说明一下,class_addMethod的第二个参数应该传入@selector(fly)而不是@selector(addFlyRuntime).因为我们是要给Person类添加一个fly的方法.可以通过runtime相关API打印出class_addMethod前后Person类的方法列表,可以看到确实是增加了一个fly方法.
+
+在调用class_addMethod之后,当前类会增加一个方法,之后继续回到消息发送流程.
+
+## 消息转发
+
+![avatar](https://s1.ax1x.com/2020/03/30/GeCZYn.png)
+
+* `forwardingTargetForSelector` 会将方法转发给一个新的接收者,相当于调用了objc_msgSend(newReceiver,sel)会重新进入消息发送流程
+
+* `forwardingTargetForSelector`如果返回nil,调用`methodSignatureForSelector`如果返回nil则整个消息流程走完抛出`unrecognized selector` 异常
+
+* `forwardInvocation` 再次提供一个消息转发机会.`NSInvocation`包装了方法调用者, 方法名,参数等信息,我们可以在这个方法中修改这个信息
+
+消息转发示例:
+注释掉上面的动态解析代码将进入方法转发的流程.我们定义一个`SuperMan`的类,并实现一个`fly`的方法
+```
+//在sel 转发给 SuperMan 对象
+- (id)forwardingTargetForSelector:(SEL)aSelector{
+    if(aSelector == @selector(fly)){
+        return [[SuperMan alloc]init];
+    }
+    return [super forwardingTargetForSelector:aSelector];
+}
+```
+
+假如`forwardingTargetForSelector`没有处理或者返回为nil则进入下一步
+
+```
+-(NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector{
+    if (aSelector == @selector(fly)) {
+        //v16@0:8 为 fly 方法的类型编码
+        return [NSMethodSignature signatureWithObjCTypes:"v16@0:8"];
+    }
+    return [super methodSignatureForSelector:aSelector];
+}
+
+- (void)forwardInvocation:(NSInvocation *)anInvocation{
+    //修改方法的接受者,将方法转发给SuperMan的一个实例
+    anInvocation.target = [[SuperMan alloc]init];
+    //调用invoke会调用objc_msgSend(superMan,@selector(fly)),回到消息发送流程
+    [anInvocation invoke];
+}
+```
+
+只要在`methodSignatureForSelector`中正确返回方法的`encode`就会走到`forwardInvocation`中,此时程序已经不会崩溃,我们可以在此做一些错误统计相关的工作

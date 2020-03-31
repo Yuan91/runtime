@@ -1,0 +1,505 @@
+# Class 结构详解
+
+查看runtime源码可以发现
+
+```
+/// An opaque type that represents an Objective-C class.
+typedef struct objc_class *Class;
+```
+
+OC层面的关键字Class是结构体objc_class的类型定义。
+
+查看其源码
+```
+struct objc_class : objc_object {
+    // Class ISA;
+    Class superclass; //指向父类
+    cache_t cache;  // 方法缓存，提高方法查找效率           
+    class_data_bits_t bits;  
+
+    class_rw_t *data() { 
+        return bits.data();
+    }
+    ....
+}
+```
+可以发现objc_class继承自objc_object，那它自然也是有一个isa指针的。
+
+objc_class的总体关系如下
+![avatar](https://s1.ax1x.com/2020/03/29/GEmT61.md.png)
+
+## instance、class、meta-class的isa指向分析
+
+在runtime层面，一个OC表现为objc_object,而class和meta-class都表现为objc_class。这三者的isa指针指向遵循以下原则：
+
+* instance的isa与上`ISA_MASK`是其类对象的地址
+
+* 类对象的isa与上`ISA_MASK`是其meta-class对象的地址
+
+* 在ARM64与_x86_x64结构上`ISA_MASK`是不同的值
+
+下面在代码中论证下以上结论。为了我们便于打印isa指针的地址，我们添加一个结构体类型，将instance和Class 转换为结构体类型
+
+```
+struct cs_objc_class {
+    Class isa;
+};
+```
+
+测试代码
+
+```
+//ISA_MASK: 0x0000000ffffffff8
+
+    Person *p = [[Person alloc]init];
+    
+    struct cs_objc_class *pStruct = (__bridge struct cs_objc_class *)(p);
+    NSLog(@"pStruct.isa:%p",pStruct->isa); //0x1a100edcfa9
+    
+    Class personClass = [Person class];
+    
+    // p->isa & ISA_MASK 刚好等于  personClass 地址
+    NSLog(@"Person class类对象地址:%p",personClass); // 0x100edcfa8
+    
+    struct cs_objc_class *classStruct = (__bridge struct cs_objc_class *)(personClass);
+    NSLog(@"classStruct.isa:%p",classStruct->isa); // 0x1a100edcf81
+    
+    Class personMetaClass = object_getClass(personClass);
+    
+    //classStruct->isa & ISA_MASK 刚好等于 元类的地址
+    NSLog(@"Person Meta class:%p",personMetaClass); // 0x100edcf80
+    
+    
+    NSLog(@"arm64 ISA_MASK:");
+```
+
+## 在继承链中isa和superClass指向分析
+
+在继承链中isa和superClass的指向满足以下关系：
+
+![avatar](https://s1.ax1x.com/2020/03/28/Gkb6oQ.png)
+
+可以看到：
+
+* 子类的类对象的superClass指向父类的类对象
+
+* 根类的类对象的superClass 指向 nil
+
+* 子类的元类对象的superClass 指向 父类的元类对象的地址
+
+除此之外,还应该看到:
+①superClass指针是存在于类对象中的,在runtime中它定义与objc_class中
+
+②因为meta-class也是一个objc_class类型,所以它也有一个isa指针,所有meta-class的isa指针都指向根类的meta-class
+
+③RootClass的superClass指针,指向RootClass类对象
+
+isa的指向上面已经分析过了，下面我们分析一下superClass的指向
+
+创建一个Person类继承自NSObject,那么它应该满足以下关系
+
+[Person class].superClass = [NSObject class]
+
+代码分析
+
+定义结构体：
+```
+struct cs_objc_class {
+    Class isa;
+    Class superclass;
+};
+```
+
+测试代码：
+```
+//运行以下程序，可以看到下面两个对象的地址总是一样的
+- (void)superClassPointer{
+    Class personClass = [Person class];
+    struct cs_objc_class *classStruct = (__bridge struct cs_objc_class *)(personClass);
+    NSLog(@"Person 类对象的地址:%p",classStruct->superclass);
+    NSLog(@"Person父类NSObject类对象地址:%p",[NSObject class]);
+}
+```
+
+## 模拟Objc_class 数据结构
+
+为了更好的访问查看objc_class信息，我们模拟runtime的objc_class数据结构写一个自己的头文件，只要数据结构类型和变量名一直就能正确提取其中的值
+
+```
+#import <Foundation/Foundation.h>
+
+#ifndef XXClassInfo_h
+#define XXClassInfo_h
+
+# if __arm64__
+#   define ISA_MASK        0x0000000ffffffff8ULL
+# elif __x86_64__
+#   define ISA_MASK        0x00007ffffffffff8ULL
+# endif
+
+#if __LP64__
+typedef uint32_t mask_t;
+#else
+typedef uint16_t mask_t;
+#endif
+typedef uintptr_t cache_key_t;
+
+struct bucket_t {
+    cache_key_t _key;
+    IMP _imp;
+};
+
+struct cache_t {
+    bucket_t *_buckets;
+    mask_t _mask;
+    mask_t _occupied;
+};
+
+struct entsize_list_tt {
+    uint32_t entsizeAndFlags;
+    uint32_t count;
+};
+
+struct method_t {
+    SEL name;
+    const char *types;
+    IMP imp;
+};
+
+struct method_list_t : entsize_list_tt {
+    method_t first;
+};
+
+struct ivar_t {
+    int32_t *offset;
+    const char *name;
+    const char *type;
+    uint32_t alignment_raw;
+    uint32_t size;
+};
+
+struct ivar_list_t : entsize_list_tt {
+    ivar_t first;
+};
+
+struct property_t {
+    const char *name;
+    const char *attributes;
+};
+
+struct property_list_t : entsize_list_tt {
+    property_t first;
+};
+
+struct chained_property_list {
+    chained_property_list *next;
+    uint32_t count;
+    property_t list[0];
+};
+
+typedef uintptr_t protocol_ref_t;
+struct protocol_list_t {
+    uintptr_t count;
+    protocol_ref_t list[0];
+};
+
+struct class_ro_t {
+    uint32_t flags;
+    uint32_t instanceStart;
+    uint32_t instanceSize;  // instance对象占用的内存空间
+#ifdef __LP64__
+    uint32_t reserved;
+#endif
+    const uint8_t * ivarLayout;
+    const char * name;  // 类名
+    method_list_t * baseMethodList;
+    protocol_list_t * baseProtocols;
+    const ivar_list_t * ivars;  // 成员变量列表
+    const uint8_t * weakIvarLayout;
+    property_list_t *baseProperties;
+};
+
+struct class_rw_t {
+    uint32_t flags;
+    uint32_t version;
+    const class_ro_t *ro;
+    method_list_t * methods;    // 方法列表
+    property_list_t *properties;    // 属性列表
+    const protocol_list_t * protocols;  // 协议列表
+    Class firstSubclass;
+    Class nextSiblingClass;
+    char *demangledName;
+};
+
+#define FAST_DATA_MASK          0x00007ffffffffff8UL
+struct class_data_bits_t {
+    uintptr_t bits;
+public:
+    class_rw_t* data() { // 提供data()方法进行 & FAST_DATA_MASK 操作
+        return (class_rw_t *)(bits & FAST_DATA_MASK);
+    }
+};
+
+/* OC对象 */
+struct xx_objc_object {
+    void *isa;
+};
+
+/* 类对象 */
+struct xx_objc_class : xx_objc_object {
+    Class superclass;
+    cache_t cache;
+    class_data_bits_t bits;
+public:
+    class_rw_t* data() {
+        return bits.data();
+    }
+    
+    xx_objc_class* metaClass() { // 提供metaClass函数，获取元类对象
+// 上一篇我们讲解过，isa指针需要经过一次 & ISA_MASK操作之后才得到真正的地址
+        return (xx_objc_class *)((long long)isa & ISA_MASK);
+    }
+};
+
+#endif /* XXClassInfo_h */
+```
+
+## 类信息存储分析
+我们可以在一个类中定义示例变量、属性、实例方法、类方法、协议等，那么这些信息都是存储在这个实例中吗？其实不然
+
+* isa和成员变量存储在instance对象中
+
+* 属性、实例方法、协议存储在类对象中
+
+* 类方法存储在元类对象中
+
+![avatar](https://s1.ax1x.com/2020/03/28/GAF5XF.png)
+
+我们在Person类定义上面的数据，然后通过我们定义的头文件查看其数据结构，可以看到结论与我们总结的是一致的
+
+```
+int main(int argc, char * argv[]) {
+    NSString * appDelegateClassName;
+    @autoreleasepool {
+        // Setup code that might create autoreleased objects goes here.
+        appDelegateClassName = NSStringFromClass([AppDelegate class]);
+        
+        Person *person = [[Person alloc]init];
+        xx_objc_class *personClass = (__bridge xx_objc_class *)[person class];
+        xx_objc_class *personMetaClass = personClass->metaClass();
+        
+        class_rw_t *personClassData = personClass->data();
+        class_rw_t *personMetaClassData = personMetaClass->data();
+        
+        NSLog(@"111");
+    }
+    return UIApplicationMain(argc, argv, nil, appDelegateClassName);
+}
+```
+
+## class_rw_t 分析
+
+### class_rw_t 数据结构分析
+
+查看runtime源码可知，class_rw_t数据结构如下
+```
+struct class_rw_t {
+    // Be warned that Symbolication knows the layout of this structure.
+    uint32_t flags;
+    uint32_t version;
+
+    const class_ro_t *ro; //
+
+    method_array_t methods; // 方法列表
+    property_array_t properties; // 属性列表
+    protocol_array_t protocols; // 协议列表
+
+    Class firstSubclass;
+    Class nextSiblingClass;
+
+    char *demangledName;
+};
+
+//ro数据结构体
+struct class_ro_t {
+    uint32_t flags;
+    uint32_t instanceStart;
+    uint32_t instanceSize;
+#ifdef __LP64__
+    uint32_t reserved;
+#endif
+
+    const uint8_t * ivarLayout;
+    
+    const char * name;
+    method_list_t * baseMethodList;//类初始的方法列表
+    protocol_list_t * baseProtocols;//类初始的协议列表
+    const ivar_list_t * ivars;//
+
+    const uint8_t * weakIvarLayout;
+    property_list_t *baseProperties;
+
+    method_list_t *baseMethods() const {
+        return baseMethodList;
+    }
+};
+```
+其中method_array_t、property_array_t、protocol_array_t是三个二位数组，是可读写的，包含了类的初始内容、分类的内容；rw有一个ro指针指向类的初始信息，这些初始信息包含在method_list_t、protocol_list_t、ivar_list_t等几个一维只读数组中。
+
+### class_rw_t 核心源码分析
+类一开始的方法、属性、协议等信息都是存储在class_ro_t中，当程序启动的时候，需要将分类中的列表跟类初始的列表合并在一起的时，就会将class_ro_t中的数据和分类的数据合并存储在class_rw_t中。
+
+通过源码分析这一过程
+
+```
+static Class realizeClassWithoutSwift(Class cls)
+{
+    runtimeLock.assertLocked();
+
+    const class_ro_t *ro;
+    class_rw_t *rw;
+    
+    if (!cls) return nil;
+    if (cls->isRealized()) return cls;
+    assert(cls == remapClass(cls));
+
+    // fixme verify class is not in an un-dlopened part of the shared cache?
+
+    //① 获取ro
+    ro = (const class_ro_t *)cls->data();
+    if (ro->flags & RO_FUTURE) {
+        // This was a future class. rw data is already allocated.
+        //如果rw
+        rw = cls->data();
+        ro = cls->data()->ro;
+        cls->changeInfo(RW_REALIZED|RW_REALIZING, RW_FUTURE);
+    } else {
+        // Normal class. Allocate writeable class data.
+        //② 创建rw分配内存空间
+        rw = (class_rw_t *)calloc(sizeof(class_rw_t), 1);
+        //③给rw->ro 赋值，并通过etData将rw赋值给cls
+        rw->ro = ro;
+        rw->flags = RW_REALIZED|RW_REALIZING;
+        cls->setData(rw);
+    }
+
+    ...
+}
+```
+
+### class_rw_t如何存储方法
+
+method_array_t是一个二维数组，存储着method_list_t类型的一维数组，这个数组中存储着method_t类型数据.
+在objective-c中每一个方法都对应一个method_t.在runtime中它的定义如下:
+```
+struct method_t {
+    SEL name; //方法的名字
+    const char *types;//方法参数,返回值的类型编码以及每一个参数所占字节组成的字符
+    IMP imp; //指向方法的地址
+};
+```
+下面分别看一下三者的具体含义
+
+#### SEL
+
+SEL 代表方法/函数名,一般叫做选择器,底层结构跟 char * 类似.
+可以通过以下两者方法获取SEL
+```
+SEL sel1 = @selector(test);
+SEL sel2 = sel_registerName("test");
+```
+
+可以通过以下两种方法将SEL转成字符串
+```
+const char *selString1 = sel_getName(sel1);
+NSString *selString2 = NSStringFromSelector(sel2);
+```
+
+通过SEL的获取方法,可以看到SEL跟跟具体的类没有对应关系的,也就是不同类中相同名字的方法,所以的SEL是相同的
+```
+SEL sel1 = @selector(test);
+SEL sel2 = sel_registerName("test");
+NSLog(@"sel1:%p sel2:%p",sel1,sel2);
+//sel1:0x7fff52516190 sel2:0x7fff52516190
+```
+
+#### types
+
+types代表方法的返回值,参数的字符编码.先通过一个例子直观的看一下它的特征
+```
+Person *person = [[Person alloc]init];
+xx_objc_class *personClass = (__bridge xx_objc_class *)[person class];
+class_rw_t *personClassData = personClass->data();
+```
+通过断点调试,查看class_rw_t中method_list_t的数据
+![avatar](https://s1.ax1x.com/2020/03/29/GE5hLD.png)
+
+可以看到其中types为`v32@0:8@16@24` 那么这其中的数字和符号分别代表什么?
+查看Apple文档可以发现iOS中的数据类型和字符的对应关系如下:
+![avavtar](https://s1.ax1x.com/2020/03/29/GEIuk9.png)
+
+按照上面结论对方法进行分析
+`- (void)person:(Person*)person doSomething:(id )something;`
+在iOS中每一个方法都有两个id self和SEL _cmd 参数.那么该方法的参数和类型分析如下
+void --> v, 第0个参数类型,占据 0 个字节的空间
+id --> @ , 第1个参数类型,占据从第 0 个字节的开始的 8 个字节的空间
+SEL --> : , 第2个参数类型,占据从第 8 个字节的开始的 8 个字节的空间
+Person --> @ , 第3个参数类型,占据从第 16 个字节的开始的 8 个字节的空间
+id --> @ , 第4个参数类型,占据从第 24 个字节的开始的 8 个字节的空间
+以上参数总计占用32个字节的空间.
+根据以上分析可知`v32@0:8@16@24` 代表如下含义:
+```
+v --> 方法返回值为void类型
+32 --> 总计占用 32 个字节
+@ --> 第一个参数类型为 id 类型
+0 --> 第一个参数从 0 个字节开始
+: --> 第二个参数是 SEL 类型
+8 --> 第二个参数从第 8 个字节开始
+@ --> 第三个参数是 id 类型
+...
+```
+
+除了上面的对应手册,iOS还提供`@encode`的方式获取类型编码
+```
+NSLog(@"%s",@encode(void)); // v
+NSLog(@"%s",@encode(int)); // i
+NSLog(@"%s",@encode(float)); // f
+```
+
+#### IMP
+IMP 代表方法的具体实现,存储的内容是方法的地址.
+运行时打印IMP地址
+```
+Printing description of personClassData->methods->first.imp:
+(IMP) imp = 0x000000010632f190 (runtime`-[Person person:doSomething:] at Person.m:21)
+```
+在方法内打断点并用汇编调试可以看到如下显示:
+![avatar](https://s1.ax1x.com/2020/03/29/GEOtJg.png)
+可以看到IMP地址和方法首地址一样的,在程序中我们可以通过该指针找到方法的实现.
+
+## cache_t 方法缓存分析
+
+在iOS中,子类可以调用当前类和父类的方法,具体在底层实现中是,先通过isa指针到当前类的方法列表去寻找是否有这个方法,如果没有的话通过superClass到父类的方法列表中去寻找,直到找到为止.但是如果没有每次调用方法都沿着继承链去查找,则效率会大大的降低,因此runtime设计了一套方法缓存体系去优化方法调用的效率.而这个缓存体系就是用`cache_t`来实现的.
+```
+struct cache_t {
+    struct bucket_t *_buckets; //缓存的方法,是一个散列表
+    mask_t _mask; //散列表的长度减一
+    mask_t _occupied;//已经缓存的方法数量
+}
+
+struct bucket_t {
+private:
+    cache_key_t _key; // SEL作为Key
+    IMP _imp; // 函数的内存地址
+};
+```
+bucket_t是一个散列表,以key-value的形式存储着调用过的方法,通过其数据结构可知,它以SEL作为key,以IMP作为value;
+
+mask是散列表的长度减一,默认情况下散列表的长度是4,即mask值是3.存储方法时,我们通过 mask&sel 可以确定当前的方法应该存储在散列表中的哪个位置,即存储在 0~3 中的哪个位置.当我们想要从缓存中取出该方法的时候,也是通过 mask&sel 确定位置,而不是依次遍历去查看是否有这个key.
+
+occupied 表示当前散列表为占用多少容量,当缓存的方法达到容量的 3/4 时,会对散列表进行扩容,每次扩容容量变成之前的2倍.因为容量发生了变化,那么mask值也会随之变化,那么之前根据 mask&sel 的计算也不在准确,所以这部分数据是会需要重新计算的.
+
+散列表的结构可以参考下图
+![avatar](https://ss1.bdstatic.com/70cFvXSh_Q1YnxGkpoWK1HF6hhy/it/u=4014323250,2453919251&fm=15&gp=0.jpg)
+
+

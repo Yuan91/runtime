@@ -1,0 +1,204 @@
+# self 与 super 分析
+
+我们知道self关键字是方法的隐藏参数,指向当前类的对象,那么与之类似的super关键字本质是什么呢
+
+## super 关键字分析
+
+```
+- (void)run{
+    [super run];
+}
+```
+将以上代码通过命令行转换为C++代码,抽取其中核心代码拿出来分析
+```
+struct __rw_objc_super { 
+	struct objc_object *object; 
+	struct objc_object *superClass; 
+	__rw_objc_super(struct objc_object *o, struct objc_object *s) : object(o), superClass(s) {} 
+};
+
+static void _I_Student_run(Student * self, SEL _cmd) {
+    objc_msgSendSuper((__rw_objc_super){
+        (id)self, 
+        (id)class_getSuperclass(objc_getClass("Student"))
+        },
+         sel_registerName("run"));
+
+}
+```
+发现`[super run]` 其实是调用的`objc_msgSendSuper`,该函数接受一个`__rw_objc_super`结构体和`SEL`.
+接着我们到runtime的源码中,去搜索查看`objc_msgSendSuper`的定义
+```
+struct objc_super {
+    /// Specifies an instance of a class.
+    //指定类的实例
+    __unsafe_unretained _Nonnull id receiver;
+
+    /// Specifies the particular superclass of the instance to message. 
+    //实例的父类,去查找消息
+    __unsafe_unretained _Nonnull Class super_class;
+};
+
+/*
+Pass values identifying the
+context the message was sent to, including the instance of the class that is to receive the
+message and the superclass at which to start searching for the method implementation.
+
+传递一个当前类的对象去接受消息,并且从他的父类去查找方法
+*/
+objc_msgSendSuper(struct objc_super * _Nonnull super, SEL _Nonnull op, ...)
+```
+
+通过以上C++代码和runtime 源码,可知通过`super`调用方法其实是调用`objc_msgSendSuper`函数.该函数的消息接收者仍然是**子类对象**,但是它**查找方法调用是从父类开始**.
+
+待深入研究:
+objc_msgSendSuper2,将代码转成汇编发送super调用的方法其实是这个.它与objc_msgSendSuper的区别是第一个参数的结构体是当前类,但是查找方法的时候还是从currentClass->superClass开始的,即父类开始的.
+
+## `[self class]`与`[super class]`打印分析
+定义一个Person类继承自NSObject,定义一个Student类继承Person.实现如下代码,分析其打印结果
+```
+- (instancetype)init{
+    self = [super init];
+    if (self) {
+        NSLog(@"[self class] = %@",[self class]); //Student
+        NSLog(@"[self superclass] = %@",[self superclass]);//Person
+        
+        NSLog(@"[super class] = %@",[super class]); //Student
+        NSLog(@"[super superclass] = %@",[super superclass]);//Person
+    }
+    return self;
+}
+```
+`[self class]`和`[self superclass]`的结果应该很清晰,打印当前类和当前类的父类.
+
+那么为什么`[super class]` 打印出来的结果是`Student`呢?
+根据上面的分析我们可知,`[super class]`其实调用的方法是`objc_msgSendSuper`,而该方法的消息接收者其实是self即`Student`对象,因为是`objc_msgSendSuper`所以从父类开始寻找`class`方法,最终在`NSObject`中找到该方法.
+
+最终`[super class]`的方法的含义应该是`student`对象调用`NSObject`类的`class`方法,获取其类型,所以应该打印的是`Student`
+
+`[super superclass]`也是同理,只不过它调用的`superClass`方法,获取的应该是`Student`的父类`Person`
+
+## `isKindOfClass` 和 `isMemberOfClass` 分析
+
+前置知识:
+* `isMemberOfClass`:判断当前实例的类型是否等于给定的类型
+* `isKindOfClass`:判断当前实例的类型**或者其继承链上父类**的类型是否等于给定的类型
+* 这两个方法都有对应的实例方法和类方法,所以当方法左边为实例对象时,右边要为类对象;左边为类对象时,右边要为元类对象.才能正确的比较
+
+查看其在runtime源码中的定义如下
+```
++ (BOOL)isMemberOfClass:(Class)cls {
+    return object_getClass((id)self) == cls;
+}
+
+- (BOOL)isMemberOfClass:(Class)cls {
+    return [self class] == cls;
+}
+
++ (BOOL)isKindOfClass:(Class)cls {
+    for (Class tcls = object_getClass((id)self); tcls; tcls = tcls->superclass) {
+        if (tcls == cls) return YES;
+    }
+    return NO;
+}
+
+- (BOOL)isKindOfClass:(Class)cls {
+    for (Class tcls = [self class]; tcls; tcls = tcls->superclass) {
+        if (tcls == cls) return YES;
+    }
+    return NO;
+}
+```
+
+### 实例方法
+
+测试两者实例方法
+```
+Person *p = [[Person alloc]init];
+        
+NSLog(@"%d",[p isMemberOfClass:[Person class]]); //1
+NSLog(@"%d",[p isMemberOfClass:[NSObject class]]);//0
+        
+NSLog(@"%d",[p isKindOfClass:[Person class]]); // 1
+NSLog(@"%d",[p isKindOfClass:[NSObject class]]); //1
+```
+`isMemberOfClass` 要求:对象p的类型和给定的类型必须一致,才输出YES
+
+`isKindOfClass` 要求:只要p的类型或其父类和给定的类型一致,则输出为YES
+
+### 类方法使用
+```
+NSLog(@"%d",[Person isMemberOfClass:[Person class]]); //0
+NSLog(@"%d",[Person isMemberOfClass:[NSObject class]]);//0
+        
+NSLog(@"%d",[Person isKindOfClass:[Person class]]); //0
+NSLog(@"%d",[Person isKindOfClass:[NSObject class]]); //1
+```
+查看runtime的源码,发现当是类方法的时候,runtime是通过`object_getClass`取左边的值,判断与右边是否相等.
+
+即左边为类对象时右边要为元类对象,才能进行比较.所以前三者很容易判定都输出为0
+
+那第四个为什么输出为1呢? 因为`isKindOfClass`会循环判断,去取元类对象的`superClass`与`[NSObject class]`类对象比较,直到`superClass`为nil.
+
+而我们知道`NSObject`的元类的`superClass`指向其类对象,所以输出为1
+
+### 一道奇葩的面试题分析
+
+i下面的代码会？Compile Error / Runtime Crash / NSLog…?
+```
+@interface Person : NSObject
+@property (nonatomic, copy) NSString *name;
+@end
+@implementation Person
+- (void)speak {
+    NSLog(@"my name's %@", self.name);
+}
+@end
+@implementation ViewController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    id cls = [Person class];
+    void *obj = &cls;
+    [(__bridge id)obj speak];
+}
+@end
+```
+
+### 什么是runtime?
+OC是一门动态性比较强的语言,允许将很多操作推迟到运行时在进行.
+OC的动态性就是通过Runtime来实现的,它是一套基于C语言的API,封装很多动态性的函数
+
+## runtime 实践
+
+### 给类动态添加成员变量和方法
+```
+    Class cls = objc_allocateClassPair([NSObject class],
+                                       "SuperMan",
+                                       0);
+    //添加方法
+    Method method = class_getInstanceMethod([self class], @selector(run));
+    IMP imp = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+    class_addMethod(cls, @selector(run), imp, types);
+
+    //添加成员变量
+    class_addIvar(cls, "_age", 4, 1, @encode(int));
+    class_addIvar(cls, "_height", 4, 1, @encode(float));
+
+    //创建类
+    objc_registerClassPair(cls);
+    
+    id instance = [[cls alloc]init];
+    [instance run];
+    [instance setValue:@10 forKey:@"_age"];
+    NSLog(@"-->%@",[instance valueForKey:@"_age"]);
+```
+
+需要注意的是:
+
+创建成员变量必须在`objc_registerClassPair`之前,因为成员变量是存储在类对象的`class_ro_t`中且是只读的,一旦类对象确定,将不能再添加成员变量
+
+### 交换方法实现
+
+![avatar](https://s1.ax1x.com/2020/04/01/GlNU0A.png)
+调用runtime的`method_exchangeImplementations`可以很方便的交换两个方法的实现,需要注意的是交换之后,`cache_t`中缓存的方法会被清空保证再次调用方法不会出错.
